@@ -54,12 +54,20 @@
 #define DS_SOCKETD_OP_PING 1u
 #define DS_SOCKETD_OP_CAPABILITIES 2u
 #define DS_SOCKETD_OP_INFO 3u
+#define DS_SOCKETD_OP_LIST_CONTAINERS 4u
 
 #define DS_SOCKETD_STATUS_OK 0u
+
+#define DS_UUID_LEN 32
+#define DS_SOCKETD_RECORD_NAME_MAX 256
+#define DS_SOCKETD_RECORD_PATH_MAX 1024
+#define DS_SOCKETD_RECORD_PORTS_MAX 16
 
 #define DS_SOCKETD_CAP_PROTOCOL_V1 (1u << 0)
 #define DS_SOCKETD_CAP_PING (1u << 1)
 #define DS_SOCKETD_CAP_CAPABILITIES (1u << 2)
+#define DS_SOCKETD_CAP_INFO (1u << 3)
+#define DS_SOCKETD_CAP_LIST_CONTAINERS (1u << 4)
 
 #define DS_SOCKETD_REQUIRED_BASE_CAPS \
 	(DS_SOCKETD_CAP_PROTOCOL_V1 | DS_SOCKETD_CAP_PING | DS_SOCKETD_CAP_CAPABILITIES)
@@ -82,6 +90,35 @@ struct DS_SOCKETD_PACKED ds_socketd_response_header {
 	uint16_t version_be;
 	uint16_t status_be;
 	uint32_t payload_len_be;
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_list_containers_req {
+	uint8_t include_all;
+	uint8_t _pad[3];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_port_record {
+	uint16_t host_port_be;
+	uint16_t host_port_end_be;
+	uint16_t container_port_be;
+	uint16_t container_port_end_be;
+	uint8_t proto;
+	uint8_t _pad[3];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_container_record {
+	char name[DS_SOCKETD_RECORD_NAME_MAX];
+	char uuid[DS_UUID_LEN + 1];
+	char rootfs_path[DS_SOCKETD_RECORD_PATH_MAX];
+	char hostname[DS_SOCKETD_RECORD_NAME_MAX];
+	char nat_ip[INET_ADDRSTRLEN];
+	char custom_init[DS_SOCKETD_RECORD_PATH_MAX];
+	int32_t pid_be;
+	uint8_t net_mode;
+	uint8_t port_count;
+	uint8_t _pad[2];
+	struct ds_socketd_port_record ports[DS_SOCKETD_RECORD_PORTS_MAX];
+	int64_t started_at_be;
 };
 
 struct DS_SOCKETD_PACKED ds_socketd_info_payload {
@@ -129,6 +166,28 @@ static const char *dswebd_arch_name(void)
 #else
 	return "unknown";
 #endif
+}
+
+static uint64_t dswebd_ntoh64(uint64_t value)
+{
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+	return value;
+#else
+	return ((uint64_t)ntohl((uint32_t)(value & 0xffffffffULL)) << 32)
+		| (uint64_t)ntohl((uint32_t)(value >> 32));
+#endif
+}
+
+static char *dswebd_decode_fixed_string(const char *data, size_t size)
+{
+	const char *nul;
+	size_t len;
+
+	if (!data || !size)
+		return xstrdup("");
+	nul = memchr(data, '\0', size);
+	len = nul ? (size_t)(nul - data) : size;
+	return xstrndup(data, len);
 }
 
 static char *dswebd_kernel_version(void)
@@ -370,6 +429,41 @@ static int dswebd_backend_info(struct dswebd_info_result *out, char **error)
 	out->containers_running = ntohl(wire.containers_running_be);
 	out->containers_stopped = ntohl(wire.containers_stopped_be);
 	free(payload);
+	return 1;
+}
+
+static int dswebd_backend_list_containers(unsigned include_all,
+		char **payload_out, uint32_t *payload_len_out, char **error)
+{
+	struct ds_socketd_list_containers_req req;
+	uint16_t status;
+	uint32_t payload_len;
+	char *payload = NULL;
+	int ok;
+
+	memset(&req, 0, sizeof(req));
+	req.include_all = include_all ? 1u : 0u;
+
+	ok = dswebd_backend_request(DS_SOCKETD_OP_LIST_CONTAINERS,
+		&req, sizeof(req), &status, &payload, &payload_len, error);
+	if (!ok)
+		return 0;
+	if (status != DS_SOCKETD_STATUS_OK) {
+		dswebd_set_error(error,
+			xasprintf("LIST_CONTAINERS returned backend status %u",
+				(unsigned)status));
+		free(payload);
+		return 0;
+	}
+	if (payload_len % sizeof(struct ds_socketd_container_record) != 0) {
+		dswebd_set_error(error,
+			xstrdup("LIST_CONTAINERS returned payload of invalid size"));
+		free(payload);
+		return 0;
+	}
+
+	*payload_out = payload;
+	*payload_len_out = payload_len;
 	return 1;
 }
 
@@ -740,6 +834,195 @@ static int dswebd_send_info(int fd, unsigned suppress_body)
 	return ok;
 }
 
+static const char *dswebd_container_state(const struct ds_socketd_container_record *record)
+{
+	int32_t pid = (int32_t)ntohl((uint32_t)record->pid_be);
+
+	return pid > 0 ? "running" : "exited";
+}
+
+static const char *dswebd_container_status(const struct ds_socketd_container_record *record)
+{
+	int32_t pid = (int32_t)ntohl((uint32_t)record->pid_be);
+
+	return pid > 0 ? "Up" : "Exited";
+}
+
+static const char *dswebd_port_type(uint8_t proto)
+{
+	return proto == 1u ? "udp" : "tcp";
+}
+
+static void dswebd_append_ports_json(char **body, size_t *len,
+		const struct ds_socketd_container_record *record)
+{
+	unsigned i;
+	unsigned port_count = record->port_count;
+
+	if (port_count > DS_SOCKETD_RECORD_PORTS_MAX)
+		port_count = DS_SOCKETD_RECORD_PORTS_MAX;
+
+	dswebd_buf_append(body, len, "\"Ports\":[");
+	for (i = 0; i < port_count; ++i) {
+		const struct ds_socketd_port_record *port = &record->ports[i];
+
+		if (i)
+			dswebd_buf_append(body, len, ",");
+		dswebd_buf_append(body, len, "{\"PrivatePort\":");
+		dswebd_buf_append_u32(body, len, ntohs(port->container_port_be));
+		dswebd_buf_append(body, len, ",\"PublicPort\":");
+		dswebd_buf_append_u32(body, len, ntohs(port->host_port_be));
+		dswebd_buf_append(body, len, ",\"Type\":");
+		dswebd_buf_append_json_string(body, len, dswebd_port_type(port->proto));
+		dswebd_buf_append(body, len, "}");
+	}
+	dswebd_buf_append(body, len, "]");
+}
+
+static void dswebd_append_network_settings_json(char **body, size_t *len,
+		const struct ds_socketd_container_record *record)
+{
+	char *nat_ip;
+
+	dswebd_buf_append(body, len, "\"NetworkSettings\":{\"Networks\":{");
+	nat_ip = dswebd_decode_fixed_string(record->nat_ip, sizeof(record->nat_ip));
+	if (record->net_mode == 1u && nat_ip[0]) {
+		dswebd_buf_append(body, len, "\"droidspaces-bridge\":{\"IPAddress\":");
+		dswebd_buf_append_json_string(body, len, nat_ip);
+		dswebd_buf_append(body, len, "}");
+	}
+	free(nat_ip);
+	dswebd_buf_append(body, len, "}}");
+}
+
+static void dswebd_append_container_json(char **body, size_t *len,
+		const struct ds_socketd_container_record *record)
+{
+	char *name = dswebd_decode_fixed_string(record->name, sizeof(record->name));
+	char *uuid = dswebd_decode_fixed_string(record->uuid, sizeof(record->uuid));
+	char *rootfs_path = dswebd_decode_fixed_string(record->rootfs_path,
+		sizeof(record->rootfs_path));
+	char *custom_init = dswebd_decode_fixed_string(record->custom_init,
+		sizeof(record->custom_init));
+	const char *command = custom_init[0] ? custom_init : "/sbin/init";
+	int64_t started_at = (int64_t)dswebd_ntoh64((uint64_t)record->started_at_be);
+
+	dswebd_buf_append(body, len, "{\"Id\":");
+	dswebd_buf_append_json_string(body, len, uuid);
+	{
+		char *docker_name = xasprintf("/%s", name);
+		dswebd_buf_append(body, len, ",\"Names\":[");
+		dswebd_buf_append_json_string(body, len, docker_name);
+		dswebd_buf_append(body, len, "],\"Image\":");
+		free(docker_name);
+	}
+	dswebd_buf_append_json_string(body, len, rootfs_path);
+	dswebd_buf_append(body, len, ",\"ImageID\":");
+	dswebd_buf_append_json_string(body, len, uuid);
+	dswebd_buf_append(body, len, ",\"Command\":");
+	dswebd_buf_append_json_string(body, len, command);
+	dswebd_buf_append(body, len, ",\"Created\":");
+	dswebd_buf_append_u64(body, len, started_at > 0 ? (uint64_t)started_at : 0);
+	dswebd_buf_append(body, len, ",");
+	dswebd_append_ports_json(body, len, record);
+	dswebd_buf_append(body, len, ",\"Labels\":{},\"State\":");
+	dswebd_buf_append_json_string(body, len, dswebd_container_state(record));
+	dswebd_buf_append(body, len, ",\"Status\":");
+	dswebd_buf_append_json_string(body, len, dswebd_container_status(record));
+	dswebd_buf_append(body, len, ",");
+	dswebd_append_network_settings_json(body, len, record);
+	dswebd_buf_append(body, len, ",\"Mounts\":[]}");
+
+	free(name);
+	free(uuid);
+	free(rootfs_path);
+	free(custom_init);
+}
+
+static unsigned dswebd_is_truthy_query_value(const char *value, size_t len)
+{
+	return len == 0
+		|| (len == 1 && value[0] == '1')
+		|| (len == 4 && memcmp(value, "true", 4) == 0);
+}
+
+static unsigned dswebd_parse_container_list_include_all(const char *target)
+{
+	const char *pos = strchr(target, '?');
+	unsigned include_all = 0;
+
+	if (!pos || !*++pos)
+		return 0;
+
+	while (*pos) {
+		const char *end = strchr(pos, '&');
+		const char *eq;
+		size_t item_len;
+		size_t key_len;
+		const char *value;
+		size_t value_len;
+
+		if (!end)
+			end = pos + strlen(pos);
+		item_len = (size_t)(end - pos);
+		eq = memchr(pos, '=', item_len);
+		key_len = eq ? (size_t)(eq - pos) : item_len;
+		value = eq ? eq + 1 : end;
+		value_len = eq ? (size_t)(end - value) : 0;
+
+		if (key_len == 3 && memcmp(pos, "all", 3) == 0)
+			include_all = dswebd_is_truthy_query_value(value, value_len);
+
+		pos = *end ? end + 1 : end;
+	}
+	return include_all;
+}
+
+static char *dswebd_build_container_list_json(const char *payload, uint32_t payload_len)
+{
+	char *body = NULL;
+	size_t len = 0;
+	uint32_t count = payload_len / sizeof(struct ds_socketd_container_record);
+	uint32_t i;
+
+	dswebd_buf_append(&body, &len, "[");
+	for (i = 0; i < count; ++i) {
+		struct ds_socketd_container_record wire;
+
+		if (i)
+			dswebd_buf_append(&body, &len, ",");
+		memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
+		dswebd_append_container_json(&body, &len, &wire);
+	}
+	dswebd_buf_append(&body, &len, "]\n");
+	return body;
+}
+
+static int dswebd_send_container_list(int fd, const char *target,
+		unsigned suppress_body)
+{
+	char *payload = NULL;
+	uint32_t payload_len = 0;
+	char *body;
+	char *error = NULL;
+	unsigned include_all;
+	int ok;
+
+	include_all = dswebd_parse_container_list_include_all(target);
+	if (!dswebd_backend_list_containers(include_all, &payload, &payload_len, &error)) {
+		ok = dswebd_send_internal_server_error(fd, error, suppress_body);
+		free(error);
+		return ok;
+	}
+
+	body = dswebd_build_container_list_json(payload, payload_len);
+	free(payload);
+	ok = dswebd_send_response(fd, 200, "OK", "application/json",
+		body, suppress_body);
+	free(body);
+	return ok;
+}
+
 static int is_ascii_digit(char c)
 {
 	return c >= '0' && c <= '9';
@@ -901,6 +1184,12 @@ static int dswebd_handle_one(int in_fd, int out_fd)
 
 	if (req.is_get && dswebd_is_api_target(req.target, "/info")) {
 		r = dswebd_send_info(out_fd, 0);
+		free(request);
+		return r ? 0 : 1;
+	}
+
+	if (req.is_get && dswebd_is_api_target(req.target, "/containers/json")) {
+		r = dswebd_send_container_list(out_fd, req.target, 0);
 		free(request);
 		return r ? 0 : 1;
 	}
