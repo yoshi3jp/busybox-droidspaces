@@ -55,19 +55,25 @@
 #define DS_SOCKETD_OP_CAPABILITIES 2u
 #define DS_SOCKETD_OP_INFO 3u
 #define DS_SOCKETD_OP_LIST_CONTAINERS 4u
+#define DS_SOCKETD_OP_INSPECT_CONTAINER 5u
 
 #define DS_SOCKETD_STATUS_OK 0u
+#define DS_SOCKETD_STATUS_NOT_FOUND 3u
 
 #define DS_UUID_LEN 32
 #define DS_SOCKETD_RECORD_NAME_MAX 256
 #define DS_SOCKETD_RECORD_PATH_MAX 1024
 #define DS_SOCKETD_RECORD_PORTS_MAX 16
+#define DS_SOCKETD_INSPECT_ENV_MAX 32
+#define DS_SOCKETD_INSPECT_BINDS_MAX 32
+#define DS_SOCKETD_INSPECT_STRING_MAX 1024
 
 #define DS_SOCKETD_CAP_PROTOCOL_V1 (1u << 0)
 #define DS_SOCKETD_CAP_PING (1u << 1)
 #define DS_SOCKETD_CAP_CAPABILITIES (1u << 2)
 #define DS_SOCKETD_CAP_INFO (1u << 3)
 #define DS_SOCKETD_CAP_LIST_CONTAINERS (1u << 4)
+#define DS_SOCKETD_CAP_INSPECT_CONTAINER (1u << 5)
 
 #define DS_SOCKETD_REQUIRED_BASE_CAPS \
 	(DS_SOCKETD_CAP_PROTOCOL_V1 | DS_SOCKETD_CAP_PING | DS_SOCKETD_CAP_CAPABILITIES)
@@ -119,6 +125,64 @@ struct DS_SOCKETD_PACKED ds_socketd_container_record {
 	uint8_t _pad[2];
 	struct ds_socketd_port_record ports[DS_SOCKETD_RECORD_PORTS_MAX];
 	int64_t started_at_be;
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_inspect_container_req {
+	char target[DS_SOCKETD_RECORD_NAME_MAX];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_env_record {
+	char key[DS_SOCKETD_RECORD_NAME_MAX];
+	char value[DS_SOCKETD_INSPECT_STRING_MAX];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_bind_record {
+	char source[DS_SOCKETD_RECORD_PATH_MAX];
+	char destination[DS_SOCKETD_RECORD_PATH_MAX];
+	uint8_t read_only;
+	uint8_t _pad[3];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_inspect_container_record_v1 {
+	uint16_t record_version_be;
+	uint16_t _header_pad;
+	uint32_t record_size_be;
+	char name[DS_SOCKETD_RECORD_NAME_MAX];
+	char uuid[DS_UUID_LEN + 1];
+	char rootfs_path[DS_SOCKETD_RECORD_PATH_MAX];
+	char image_ref[DS_SOCKETD_RECORD_PATH_MAX];
+	char hostname[DS_SOCKETD_RECORD_NAME_MAX];
+	char nat_ip[INET_ADDRSTRLEN];
+	char custom_init[DS_SOCKETD_RECORD_PATH_MAX];
+	char dns_servers[DS_SOCKETD_INSPECT_STRING_MAX];
+	int32_t pid_be;
+	int64_t started_at_be;
+	int64_t memory_limit_be;
+	int64_t cpu_quota_be;
+	int64_t cpu_period_be;
+	int64_t pids_limit_be;
+	int32_t privileged_mask_be;
+	uint8_t net_mode;
+	uint8_t foreground;
+	uint8_t volatile_mode;
+	uint8_t force_cgroupv1;
+	uint8_t disable_ipv6;
+	uint8_t android_storage;
+	uint8_t selinux_permissive;
+	uint8_t hw_access;
+	uint8_t gpu_mode;
+	uint8_t termux_x11;
+	uint8_t block_nested_ns;
+	uint8_t is_img_mount;
+	uint16_t env_count_be;
+	uint16_t env_total_count_be;
+	uint16_t bind_count_be;
+	uint16_t bind_total_count_be;
+	uint16_t port_count_be;
+	uint16_t port_total_count_be;
+	struct ds_socketd_env_record env[DS_SOCKETD_INSPECT_ENV_MAX];
+	struct ds_socketd_bind_record binds[DS_SOCKETD_INSPECT_BINDS_MAX];
+	struct ds_socketd_port_record ports[DS_SOCKETD_RECORD_PORTS_MAX];
 };
 
 struct DS_SOCKETD_PACKED ds_socketd_info_payload {
@@ -464,6 +528,65 @@ static int dswebd_backend_list_containers(unsigned include_all,
 
 	*payload_out = payload;
 	*payload_len_out = payload_len;
+	return 1;
+}
+
+static int dswebd_backend_inspect_container(const char *ref,
+		struct ds_socketd_inspect_container_record_v1 *out,
+		unsigned *not_found, char **error)
+{
+	struct ds_socketd_inspect_container_req req;
+	uint16_t status;
+	uint32_t payload_len;
+	char *payload = NULL;
+	uint16_t record_version;
+	uint32_t record_size;
+	int ok;
+
+	*not_found = 0;
+	if (!ref || !ref[0] || strlen(ref) >= DS_SOCKETD_RECORD_NAME_MAX) {
+		dswebd_set_error(error, xstrdup("container reference is empty or too long"));
+		return 0;
+	}
+
+	memset(&req, 0, sizeof(req));
+	strncpy(req.target, ref, sizeof(req.target) - 1);
+
+	ok = dswebd_backend_request(DS_SOCKETD_OP_INSPECT_CONTAINER,
+		&req, sizeof(req), &status, &payload, &payload_len, error);
+	if (!ok)
+		return 0;
+	if (status == DS_SOCKETD_STATUS_NOT_FOUND) {
+		*not_found = 1;
+		dswebd_set_error(error, xstrdup("container not found"));
+		free(payload);
+		return 0;
+	}
+	if (status != DS_SOCKETD_STATUS_OK) {
+		dswebd_set_error(error,
+			xasprintf("INSPECT_CONTAINER returned backend status %u",
+				(unsigned)status));
+		free(payload);
+		return 0;
+	}
+	if (payload_len != sizeof(*out)) {
+		dswebd_set_error(error,
+			xstrdup("INSPECT_CONTAINER returned payload of unexpected size"));
+		free(payload);
+		return 0;
+	}
+
+	memcpy(out, payload, sizeof(*out));
+	free(payload);
+
+	record_version = ntohs(out->record_version_be);
+	record_size = ntohl(out->record_size_be);
+	if (record_version != 1u || record_size != sizeof(*out)) {
+		dswebd_set_error(error,
+			xstrdup("INSPECT_CONTAINER returned unsupported inspect record version"));
+		return 0;
+	}
+
 	return 1;
 }
 
@@ -1023,6 +1146,288 @@ static int dswebd_send_container_list(int fd, const char *target,
 	return ok;
 }
 
+static char *dswebd_rfc3339_utc(int64_t unix_seconds)
+{
+	static const char zero_time[] = "0001-01-01T00:00:00Z";
+	time_t value;
+	struct tm tm;
+	char buf[64];
+
+	if (unix_seconds <= 0)
+		return xstrdup(zero_time);
+	value = (time_t)unix_seconds;
+	if ((int64_t)value != unix_seconds)
+		return xstrdup(zero_time);
+	if (!gmtime_r(&value, &tm))
+		return xstrdup(zero_time);
+	if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+		return xstrdup(zero_time);
+	return xstrdup(buf);
+}
+
+static int32_t dswebd_inspect_pid(const struct ds_socketd_inspect_container_record_v1 *record)
+{
+	return (int32_t)ntohl((uint32_t)record->pid_be);
+}
+
+static uint16_t dswebd_inspect_port_count(const struct ds_socketd_inspect_container_record_v1 *record)
+{
+	uint16_t count = ntohs(record->port_count_be);
+
+	return count > DS_SOCKETD_RECORD_PORTS_MAX ? DS_SOCKETD_RECORD_PORTS_MAX : count;
+}
+
+static const char *dswebd_docker_network_mode(uint8_t mode)
+{
+	switch (mode) {
+	case 1u:
+		return "bridge";
+	case 2u:
+		return "none";
+	case 0u:
+	default:
+		return "host";
+	}
+}
+
+static void dswebd_append_named_json_string(char **body, size_t *len,
+		const char *name, const char *value)
+{
+	dswebd_buf_append(body, len, "\"");
+	dswebd_buf_append(body, len, name);
+	dswebd_buf_append(body, len, "\":");
+	dswebd_buf_append_json_string(body, len, value ? value : "");
+}
+
+static void dswebd_append_inspect_port_map_json(char **body, size_t *len,
+		const struct ds_socketd_inspect_container_record_v1 *record,
+		unsigned include_host_bindings)
+{
+	uint16_t port_count = dswebd_inspect_port_count(record);
+	uint16_t i;
+
+	dswebd_buf_append(body, len, "{");
+	for (i = 0; i < port_count; ++i) {
+		const struct ds_socketd_port_record *port = &record->ports[i];
+
+		if (i)
+			dswebd_buf_append(body, len, ",");
+		dswebd_buf_append(body, len, "\"");
+		dswebd_buf_append_u32(body, len, ntohs(port->container_port_be));
+		dswebd_buf_append(body, len, "/");
+		dswebd_buf_append(body, len, dswebd_port_type(port->proto));
+		dswebd_buf_append(body, len, "\":");
+		if (include_host_bindings) {
+			dswebd_buf_append(body, len, "[{\"HostIp\":\"\",\"HostPort\":\"");
+			dswebd_buf_append_u32(body, len, ntohs(port->host_port_be));
+			dswebd_buf_append(body, len, "\"}]");
+		} else {
+			dswebd_buf_append(body, len, "{}");
+		}
+	}
+	dswebd_buf_append(body, len, "}");
+}
+
+static void dswebd_append_inspect_config_json(char **body, size_t *len,
+		const struct ds_socketd_inspect_container_record_v1 *record,
+		const char *command, const char *image)
+{
+	char *hostname = dswebd_decode_fixed_string(record->hostname, sizeof(record->hostname));
+
+	dswebd_buf_append(body, len, "\"Config\":{");
+	dswebd_append_named_json_string(body, len, "Hostname", hostname);
+	dswebd_buf_append(body, len, ",\"Domainname\":\"\",");
+	dswebd_buf_append(body, len, "\"User\":\"\",\"AttachStdin\":false,");
+	dswebd_buf_append(body, len, "\"AttachStdout\":false,\"AttachStderr\":false,");
+	dswebd_buf_append(body, len, "\"ExposedPorts\":");
+	dswebd_append_inspect_port_map_json(body, len, record, 0);
+	dswebd_buf_append(body, len, ",\"Tty\":false,\"OpenStdin\":false,");
+	dswebd_buf_append(body, len, "\"StdinOnce\":false,\"Env\":[],\"Cmd\":[");
+	dswebd_buf_append_json_string(body, len, command);
+	dswebd_buf_append(body, len, "],");
+	dswebd_append_named_json_string(body, len, "Image", image);
+	dswebd_buf_append(body, len, ",\"Volumes\":{},\"WorkingDir\":\"\",");
+	dswebd_buf_append(body, len, "\"Entrypoint\":[],\"OnBuild\":[],\"Labels\":{}");
+	dswebd_buf_append(body, len, "}");
+
+	free(hostname);
+}
+
+static void dswebd_append_inspect_host_config_json(char **body, size_t *len,
+		const struct ds_socketd_inspect_container_record_v1 *record)
+{
+	dswebd_buf_append(body, len, "\"HostConfig\":{");
+	dswebd_buf_append(body, len, "\"Binds\":[],\"ContainerIDFile\":\"\",");
+	dswebd_buf_append(body, len, "\"LogConfig\":{\"Type\":\"\",\"Config\":{}},");
+	dswebd_buf_append(body, len, "\"NetworkMode\":\"");
+	dswebd_buf_append(body, len, dswebd_docker_network_mode(record->net_mode));
+	dswebd_buf_append(body, len, "\",\"PortBindings\":");
+	dswebd_append_inspect_port_map_json(body, len, record, 1);
+	dswebd_buf_append(body, len, ",\"RestartPolicy\":{\"Name\":\"\",\"MaximumRetryCount\":0},");
+	dswebd_buf_append(body, len, "\"AutoRemove\":false,\"VolumeDriver\":\"\",\"VolumesFrom\":[],");
+	dswebd_buf_append(body, len, "\"CapAdd\":[],\"CapDrop\":[],\"CgroupnsMode\":\"\",");
+	dswebd_buf_append(body, len, "\"Dns\":[],\"DnsOptions\":[],\"DnsSearch\":[],\"ExtraHosts\":[],");
+	dswebd_buf_append(body, len, "\"GroupAdd\":[],\"IpcMode\":\"\",\"Cgroup\":\"\",\"Links\":[],");
+	dswebd_buf_append(body, len, "\"OomScoreAdj\":0,\"PidMode\":\"\",");
+	dswebd_buf_append(body, len, "\"Privileged\":false,\"PublishAllPorts\":false,");
+	dswebd_buf_append(body, len, "\"ReadonlyRootfs\":false,\"SecurityOpt\":[],\"UTSMode\":\"\",");
+	dswebd_buf_append(body, len, "\"UsernsMode\":\"\",\"ShmSize\":0,\"Runtime\":\"\",");
+	dswebd_buf_append(body, len, "\"ConsoleSize\":[0,0],\"Isolation\":\"\",");
+	dswebd_buf_append(body, len, "\"CpuShares\":0,\"Memory\":0,\"NanoCpus\":0,");
+	dswebd_buf_append(body, len, "\"CgroupParent\":\"\",\"BlkioWeight\":0,");
+	dswebd_buf_append(body, len, "\"BlkioWeightDevice\":[],\"BlkioDeviceReadBps\":[],");
+	dswebd_buf_append(body, len, "\"BlkioDeviceWriteBps\":[],\"BlkioDeviceReadIOps\":[],");
+	dswebd_buf_append(body, len, "\"BlkioDeviceWriteIOps\":[],\"CpuPeriod\":0,\"CpuQuota\":0,");
+	dswebd_buf_append(body, len, "\"CpuRealtimePeriod\":0,\"CpuRealtimeRuntime\":0,");
+	dswebd_buf_append(body, len, "\"CpusetCpus\":\"\",\"CpusetMems\":\"\",\"Devices\":[],");
+	dswebd_buf_append(body, len, "\"DeviceCgroupRules\":[],\"DeviceRequests\":[],");
+	dswebd_buf_append(body, len, "\"KernelMemory\":0,\"KernelMemoryTCP\":0,");
+	dswebd_buf_append(body, len, "\"MemoryReservation\":0,\"MemorySwap\":0,");
+	dswebd_buf_append(body, len, "\"MemorySwappiness\":0,\"OomKillDisable\":false,");
+	dswebd_buf_append(body, len, "\"PidsLimit\":0,\"Ulimits\":[],\"CpuCount\":0,");
+	dswebd_buf_append(body, len, "\"CpuPercent\":0,\"IOMaximumIOps\":0,");
+	dswebd_buf_append(body, len, "\"IOMaximumBandwidth\":0,\"MaskedPaths\":[],\"ReadonlyPaths\":[]");
+	dswebd_buf_append(body, len, "}");
+}
+
+static void dswebd_append_inspect_state_json(char **body, size_t *len,
+		const struct ds_socketd_inspect_container_record_v1 *record,
+		const char *started_at)
+{
+	int32_t pid = dswebd_inspect_pid(record);
+
+	dswebd_buf_append(body, len, "\"State\":{");
+	dswebd_buf_append(body, len, "\"Status\":\"");
+	dswebd_buf_append(body, len, pid > 0 ? "running" : "exited");
+	dswebd_buf_append(body, len, "\",\"Running\":");
+	dswebd_buf_append(body, len, pid > 0 ? "true" : "false");
+	dswebd_buf_append(body, len, ",\"Paused\":false,\"Restarting\":false,");
+	dswebd_buf_append(body, len, "\"OOMKilled\":false,\"Dead\":false,\"Pid\":");
+	dswebd_buf_append_u32(body, len, pid > 0 ? (uint32_t)pid : 0);
+	dswebd_buf_append(body, len, ",\"ExitCode\":0,\"Error\":\"\",\"StartedAt\":");
+	dswebd_buf_append_json_string(body, len, started_at);
+	dswebd_buf_append(body, len, ",\"FinishedAt\":\"0001-01-01T00:00:00Z\"");
+	dswebd_buf_append(body, len, "}");
+}
+
+static void dswebd_append_inspect_networks_json(char **body, size_t *len,
+		const struct ds_socketd_inspect_container_record_v1 *record)
+{
+	char *nat_ip = dswebd_decode_fixed_string(record->nat_ip, sizeof(record->nat_ip));
+
+	dswebd_buf_append(body, len, "\"Networks\":{");
+	if (record->net_mode == 1u) {
+		dswebd_buf_append(body, len, "\"droidspaces-bridge\":{");
+		dswebd_buf_append(body, len, "\"IPAMConfig\":{},\"Links\":[],\"Aliases\":[],");
+		dswebd_buf_append(body, len, "\"NetworkID\":\"\",\"EndpointID\":\"\",\"Gateway\":\"\",");
+		dswebd_buf_append(body, len, "\"IPAddress\":");
+		dswebd_buf_append_json_string(body, len, nat_ip);
+		dswebd_buf_append(body, len, ",\"IPPrefixLen\":0,\"IPv6Gateway\":\"\",");
+		dswebd_buf_append(body, len, "\"GlobalIPv6Address\":\"\",\"GlobalIPv6PrefixLen\":0,");
+		dswebd_buf_append(body, len, "\"MacAddress\":\"\",\"DriverOpts\":{}");
+		dswebd_buf_append(body, len, "}");
+	}
+	dswebd_buf_append(body, len, "}");
+	free(nat_ip);
+}
+
+static void dswebd_append_inspect_network_settings_json(char **body, size_t *len,
+		const struct ds_socketd_inspect_container_record_v1 *record)
+{
+	char *nat_ip = dswebd_decode_fixed_string(record->nat_ip, sizeof(record->nat_ip));
+
+	dswebd_buf_append(body, len, "\"NetworkSettings\":{");
+	dswebd_buf_append(body, len, "\"Bridge\":\"\",\"SandboxID\":\"\",\"HairpinMode\":false,");
+	dswebd_buf_append(body, len, "\"LinkLocalIPv6Address\":\"\",\"LinkLocalIPv6PrefixLen\":0,");
+	dswebd_buf_append(body, len, "\"Ports\":");
+	dswebd_append_inspect_port_map_json(body, len, record, 1);
+	dswebd_buf_append(body, len, ",\"SandboxKey\":\"\",\"SecondaryIPAddresses\":[],");
+	dswebd_buf_append(body, len, "\"SecondaryIPv6Addresses\":[],\"EndpointID\":\"\",\"Gateway\":\"\",");
+	dswebd_buf_append(body, len, "\"GlobalIPv6Address\":\"\",\"GlobalIPv6PrefixLen\":0,");
+	dswebd_buf_append(body, len, "\"IPAddress\":");
+	dswebd_buf_append_json_string(body, len, record->net_mode == 1u ? nat_ip : "");
+	dswebd_buf_append(body, len, ",\"IPPrefixLen\":0,\"IPv6Gateway\":\"\",\"MacAddress\":\"\",");
+	dswebd_append_inspect_networks_json(body, len, record);
+	dswebd_buf_append(body, len, "}");
+
+	free(nat_ip);
+}
+
+static char *dswebd_build_container_inspect_json(
+		const struct ds_socketd_inspect_container_record_v1 *record)
+{
+	char *body = NULL;
+	size_t len = 0;
+	char *name = dswebd_decode_fixed_string(record->name, sizeof(record->name));
+	char *uuid = dswebd_decode_fixed_string(record->uuid, sizeof(record->uuid));
+	char *rootfs_path = dswebd_decode_fixed_string(record->rootfs_path, sizeof(record->rootfs_path));
+	char *image_ref = dswebd_decode_fixed_string(record->image_ref, sizeof(record->image_ref));
+	char *custom_init = dswebd_decode_fixed_string(record->custom_init, sizeof(record->custom_init));
+	const char *command = custom_init[0] ? custom_init : "/sbin/init";
+	const char *image = image_ref[0] ? image_ref : rootfs_path;
+	int64_t started_epoch = (int64_t)dswebd_ntoh64((uint64_t)record->started_at_be);
+	char *started_at = dswebd_rfc3339_utc(started_epoch);
+	char *docker_name = xasprintf("/%s", name);
+
+	dswebd_buf_append(&body, &len, "{");
+	dswebd_buf_append(&body, &len, "\"AppArmorProfile\":\"\",\"Args\":[],");
+	dswebd_append_inspect_config_json(&body, &len, record, command, image);
+	dswebd_buf_append(&body, &len, ",\"Created\":");
+	dswebd_buf_append_json_string(&body, &len, started_at);
+	dswebd_buf_append(&body, &len, ",\"Driver\":\"droidspaces\",\"ExecIDs\":[],");
+	dswebd_append_inspect_host_config_json(&body, &len, record);
+	dswebd_buf_append(&body, &len, ",\"HostnamePath\":\"\",\"HostsPath\":\"\",\"LogPath\":\"\",");
+	dswebd_append_named_json_string(&body, &len, "Id", uuid);
+	dswebd_buf_append(&body, &len, ",");
+	dswebd_append_named_json_string(&body, &len, "Image", image);
+	dswebd_buf_append(&body, &len, ",\"MountLabel\":\"\",");
+	dswebd_append_named_json_string(&body, &len, "Name", docker_name);
+	dswebd_buf_append(&body, &len, ",");
+	dswebd_append_inspect_network_settings_json(&body, &len, record);
+	dswebd_buf_append(&body, &len, ",");
+	dswebd_append_named_json_string(&body, &len, "Path", command);
+	dswebd_buf_append(&body, &len, ",\"ProcessLabel\":\"\",\"ResolvConfPath\":\"\",");
+	dswebd_buf_append(&body, &len, "\"RestartCount\":0,");
+	dswebd_append_inspect_state_json(&body, &len, record, started_at);
+	dswebd_buf_append(&body, &len, ",\"Mounts\":[]");
+	dswebd_buf_append(&body, &len, "}\n");
+
+	free(name);
+	free(uuid);
+	free(rootfs_path);
+	free(image_ref);
+	free(custom_init);
+	free(started_at);
+	free(docker_name);
+	return body;
+}
+
+static int dswebd_send_container_inspect(int fd, const char *ref,
+		unsigned suppress_body)
+{
+	struct ds_socketd_inspect_container_record_v1 record;
+	unsigned not_found = 0;
+	char *body;
+	char *error = NULL;
+	int ok;
+
+	memset(&record, 0, sizeof(record));
+	if (!dswebd_backend_inspect_container(ref, &record, &not_found, &error)) {
+		if (not_found) {
+			free(error);
+			return dswebd_send_not_found(fd, suppress_body);
+		}
+		ok = dswebd_send_internal_server_error(fd, error, suppress_body);
+		free(error);
+		return ok;
+	}
+
+	body = dswebd_build_container_inspect_json(&record);
+	ok = dswebd_send_response(fd, 200, "OK", "application/json", body, suppress_body);
+	free(body);
+	return ok;
+}
+
 static int is_ascii_digit(char c)
 {
 	return c >= '0' && c <= '9';
@@ -1073,6 +1478,66 @@ static int dswebd_is_api_target(const char *target, const char *endpoint)
 		|| dswebd_is_versioned_api_path(path, endpoint);
 	free(path);
 	return result;
+}
+
+static char *dswebd_strip_api_version_prefix(char *path)
+{
+	size_t i;
+	size_t major_start;
+	size_t minor_start;
+
+	if (!is_prefixed_with(path, "/v"))
+		return path;
+	i = 2;
+	major_start = i;
+	while (path[i] && is_ascii_digit(path[i]))
+		i++;
+	if (i == major_start || path[i] != '.')
+		return path;
+	i++;
+	minor_start = i;
+	while (path[i] && is_ascii_digit(path[i]))
+		i++;
+	if (i == minor_start || path[i] != '/')
+		return path;
+	return path + i;
+}
+
+static char *dswebd_parse_container_ref_with_suffix(const char *target,
+		const char *suffix)
+{
+	static const char prefix[] = "/containers/";
+	char *path = xstrdup(target);
+	char *q = strchr(path, '?');
+	char *unversioned;
+	size_t path_len;
+	size_t prefix_len = sizeof(prefix) - 1;
+	size_t suffix_len = strlen(suffix);
+	char *ref;
+	char *slash;
+
+	if (q)
+		*q = '\0';
+	unversioned = dswebd_strip_api_version_prefix(path);
+	path_len = strlen(unversioned);
+	if (path_len <= prefix_len + suffix_len
+	 || strncmp(unversioned, prefix, prefix_len) != 0
+	 || strcmp(unversioned + path_len - suffix_len, suffix) != 0) {
+		free(path);
+		return NULL;
+	}
+
+	ref = xstrndup(unversioned + prefix_len,
+		path_len - prefix_len - suffix_len);
+	slash = strchr(ref, '/');
+	if (!ref[0] || slash) {
+		free(ref);
+		free(path);
+		return NULL;
+	}
+
+	free(path);
+	return ref;
 }
 
 static int dswebd_parse_request_line(char *line, struct dswebd_req *req)
@@ -1192,6 +1657,16 @@ static int dswebd_handle_one(int in_fd, int out_fd)
 		r = dswebd_send_container_list(out_fd, req.target, 0);
 		free(request);
 		return r ? 0 : 1;
+	}
+
+	if (req.is_get) {
+		char *ref = dswebd_parse_container_ref_with_suffix(req.target, "/json");
+		if (ref) {
+			r = dswebd_send_container_inspect(out_fd, ref, 0);
+			free(ref);
+			free(request);
+			return r ? 0 : 1;
+		}
 	}
 
 	free(request);
