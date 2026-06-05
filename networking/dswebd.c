@@ -27,6 +27,9 @@
 //usage:     "\n\t-p ARG\tListen on PORT or ADDR:PORT (default 0.0.0.0:2375)"
 
 #include "libbb.h"
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+#include "httpd_api.h"
+#endif
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -2142,6 +2145,198 @@ static char *dswebd_parse_container_ref_with_suffix(const char *target,
 	free(path);
 	return ref;
 }
+
+
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+static int dswebd_httpd_result(int ok)
+{
+	return ok ? HTTPD_API_HANDLED : HTTPD_API_ERROR;
+}
+
+static int dswebd_httpd_method_is(const struct httpd_api_request *req,
+		const char *method)
+{
+	return req->method && strcmp(req->method, method) == 0;
+}
+
+static const char *dswebd_const_strip_api_version_prefix(const char *path)
+{
+	size_t i;
+	size_t major_start;
+	size_t minor_start;
+
+	if (!is_prefixed_with(path, "/v"))
+		return path;
+	i = 2;
+	major_start = i;
+	while (path[i] && is_ascii_digit(path[i]))
+		i++;
+	if (i == major_start || path[i] != '.')
+		return path;
+	i++;
+	minor_start = i;
+	while (path[i] && is_ascii_digit(path[i]))
+		i++;
+	if (i == minor_start || path[i] != '/')
+		return path;
+	return path + i;
+}
+
+static int dswebd_httpd_handle_container_path(
+		const struct httpd_api_request *req, const char *path)
+{
+	char *ref;
+	int r;
+
+	if (dswebd_httpd_method_is(req, "GET")) {
+		ref = dswebd_parse_container_ref_with_suffix(path, "/json");
+		if (ref) {
+			r = dswebd_send_container_inspect(req->out_fd, ref, 0);
+			free(ref);
+			return dswebd_httpd_result(r);
+		}
+	}
+
+	if (dswebd_httpd_method_is(req, "POST")) {
+		ref = dswebd_parse_container_ref_with_suffix(path, "/start");
+		if (ref) {
+			r = dswebd_send_lifecycle(req->out_fd, req->target, ref,
+				DS_SOCKETD_OP_START_CONTAINER, -1, 0);
+			free(ref);
+			return dswebd_httpd_result(r);
+		}
+
+		ref = dswebd_parse_container_ref_with_suffix(path, "/stop");
+		if (ref) {
+			r = dswebd_send_lifecycle(req->out_fd, req->target, ref,
+				DS_SOCKETD_OP_STOP_CONTAINER, -1, 1);
+			free(ref);
+			return dswebd_httpd_result(r);
+		}
+
+		ref = dswebd_parse_container_ref_with_suffix(path, "/restart");
+		if (ref) {
+			r = dswebd_send_lifecycle(req->out_fd, req->target, ref,
+				DS_SOCKETD_OP_RESTART_CONTAINER, -1, 1);
+			free(ref);
+			return dswebd_httpd_result(r);
+		}
+	}
+
+	return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+}
+
+static int dswebd_httpd_dispatch_path(
+		const struct httpd_api_request *req, const char *path,
+		unsigned force_not_found)
+{
+	int r;
+
+	if (strcmp(path, "/_ping") == 0) {
+		if (dswebd_httpd_method_is(req, "GET") || dswebd_httpd_method_is(req, "HEAD"))
+			return dswebd_httpd_result(dswebd_send_ping(req->out_fd, req->is_head));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/version") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_version(req->out_fd, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/info") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_info(req->out_fd, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/containers/json") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_container_list(req->out_fd,
+				req->target, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/images/json") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_image_list(req->out_fd, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/volumes") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_volume_list(req->out_fd, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/networks") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_network_list(req->out_fd, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (strcmp(path, "/events") == 0) {
+		if (dswebd_httpd_method_is(req, "GET"))
+			return dswebd_httpd_result(dswebd_send_events(req->out_fd,
+				req->target, 0));
+		return dswebd_httpd_result(dswebd_send_not_found(req->out_fd, req->is_head));
+	}
+
+	if (is_prefixed_with(path, "/containers/"))
+		return dswebd_httpd_handle_container_path(req, path);
+
+	if (force_not_found) {
+		r = dswebd_send_not_found(req->out_fd, req->is_head);
+		return dswebd_httpd_result(r);
+	}
+	return HTTPD_API_NOT_HANDLED;
+}
+
+static int dswebd_httpd_handle_exact(const struct httpd_api_request *req)
+{
+	return dswebd_httpd_dispatch_path(req, req->path, 1);
+}
+
+static int dswebd_httpd_resolve_containers(const struct httpd_api_request *req)
+{
+	if (!is_prefixed_with(req->path, "/containers/"))
+		return HTTPD_API_NOT_HANDLED;
+	return dswebd_httpd_dispatch_path(req, req->path, 1);
+}
+
+static int dswebd_httpd_resolve_versioned(const struct httpd_api_request *req)
+{
+	const char *unversioned;
+
+	unversioned = dswebd_const_strip_api_version_prefix(req->path);
+	if (unversioned == req->path)
+		return HTTPD_API_NOT_HANDLED;
+	return dswebd_httpd_dispatch_path(req, unversioned, 1);
+}
+
+static int dswebd_httpd_register_provider(const struct httpd_api_registrar *reg)
+{
+	int rc = 0;
+
+	rc |= reg->endpoint("/_ping", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/version", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/info", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/containers/json", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/images/json", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/volumes", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/networks", dswebd_httpd_handle_exact);
+	rc |= reg->endpoint("/events", dswebd_httpd_handle_exact);
+	rc |= reg->prefix("/containers/", dswebd_httpd_resolve_containers);
+	rc |= reg->prefix("/v", dswebd_httpd_resolve_versioned);
+
+	return rc ? -1 : 0;
+}
+
+const struct httpd_api_provider dswebd_httpd_api_provider = {
+	.name = "dswebd",
+	.register_provider = dswebd_httpd_register_provider,
+};
+#endif
 
 static int dswebd_parse_request_line(char *line, struct dswebd_req *req)
 {

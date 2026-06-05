@@ -37,10 +37,17 @@ static unsigned registered_prefix_count;
 static unsigned enabled_provider_count;
 
 /*
- * Portable BusyBox-style provider table. Phase 7 intentionally ships with
- * no provider wired in; Phase 8 will add dswebd here under ENABLE_DSWEBD.
+ * Portable BusyBox-style provider table. Providers are compiled in by applet
+ * configuration, but still must be explicitly enabled at httpd runtime.
  */
+#if ENABLE_DSWEBD
+extern const struct httpd_api_provider dswebd_httpd_api_provider;
+#endif
+
 static const struct httpd_api_provider *const available_providers[] = {
+#if ENABLE_DSWEBD
+	&dswebd_httpd_api_provider,
+#endif
 	NULL,
 };
 
