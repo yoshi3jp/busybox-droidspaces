@@ -102,6 +102,16 @@
 //config:	help
 //config:	HTTP server.
 //config:
+//config:config FEATURE_HTTPD_API_REGISTRY
+//config:	bool "Enable httpd API provider registry"
+//config:	default n
+//config:	depends on HTTPD
+//config:	help
+//config:	Allows httpd to dispatch selected request paths to explicitly
+//config:	enabled API providers before falling through to normal static
+//config:	file hosting. Providers are not enabled unless requested at
+//config:	httpd invocation time.
+//config:
 //config:config FEATURE_HTTPD_PORT_DEFAULT
 //config:	int "Default port"
 //config:	default 80
@@ -267,6 +277,7 @@
 //usage:       "[-ifv[v]]"
 //usage:       " [-c CONFFILE]"
 //usage:       " [-p [IP:]PORT]"
+//usage:	IF_FEATURE_HTTPD_API_REGISTRY(" [-A PROVIDERS]")
 //usage:       " [-M MAXCONN]"
 //usage:	IF_FEATURE_HTTPD_CGI(" [-K KILLSEC]")
 //usage:	IF_FEATURE_HTTPD_SETUID(" [-u USER[:GRP]]")
@@ -279,6 +290,8 @@
 //usage:     "\n	-f		Run in foreground"
 //usage:     "\n	-v[v]		Verbose"
 //usage:     "\n	-p [IP:]PORT	Bind to IP:PORT (default *:"STR(CONFIG_FEATURE_HTTPD_PORT_DEFAULT)")"
+//usage:	IF_FEATURE_HTTPD_API_REGISTRY(
+//usage:     "\n	-A PROVIDERS	Enable comma-separated API providers")
 //usage:     "\n	-M NUM		Pause if NUM connections are open (default 256)"
 //usage:	IF_FEATURE_HTTPD_CGI(
 //usage:     "\n	-K NUM		Kill CGIs after NUM seconds")
@@ -330,6 +343,9 @@
 
 #include "libbb.h"
 #include "common_bufsiz.h"
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+# include "httpd_api.h"
+#endif
 #if ENABLE_PAM
 /* PAM may include <locale.h>. We may need to undefine bbox's stub define: */
 # undef setlocale
@@ -537,7 +553,7 @@ struct globals {
 #endif
 	char *hdr_ptr;
 	int hdr_cnt;
-#if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_PROXY
+#if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_PROXY || ENABLE_FEATURE_HTTPD_API_REGISTRY
 	int POST_len;
 #endif
 #if ENABLE_FEATURE_HTTPD_CGI
@@ -2343,11 +2359,16 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 	unsigned total_headers_len;
 	unsigned un;
 #endif
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+	char *api_target;
+#endif
 	const char *prequest;
 	static const char request_GET[]  ALIGN1 = "GET";
 	static const char request_HEAD[] ALIGN1 = "HEAD";
-#if ENABLE_FEATURE_HTTPD_CGI
+#if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_API_REGISTRY
 	static const char request_POST[] ALIGN1 = "POST";
+#endif
+#if ENABLE_FEATURE_HTTPD_CGI
 	enum CGI_type {
 		CGI_NONE = 0,
 		CGI_NORMAL,
@@ -2363,6 +2384,9 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 #endif
 	char *HTTP_slash;
 
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+	api_target = NULL;
+#endif
 	if (ENABLE_FEATURE_HTTPD_CGI || DEBUG || verbose) {
 		/* NB: can be NULL (user runs httpd -i by hand?) */
 		rmt_ip_str = xmalloc_sockaddr2dotted(&fromAddr->u.sa);
@@ -2473,12 +2497,14 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 	prequest = request_HEAD;
 	if (strcmp(iobuf, prequest) == 0)
 		goto found;
-#if !ENABLE_FEATURE_HTTPD_CGI
-	send_headers_and_exit(HTTP_NOT_IMPLEMENTED);
-#else
+#if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_API_REGISTRY
 	prequest = request_POST;
 	if (strcmp(iobuf, prequest) == 0)
 		goto found;
+#endif
+#if !ENABLE_FEATURE_HTTPD_CGI
+	send_headers_and_exit(HTTP_NOT_IMPLEMENTED);
+#else
 	/* For CGI, allow DELETE, PUT, OPTIONS, etc too */
 	prequest = alloca(16);
 	un = safe_strncpy((char*)prequest, iobuf, 16) - prequest;
@@ -2486,6 +2512,9 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		send_headers_and_exit(HTTP_BAD_REQUEST);
 #endif
  found:
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+	api_target = xstrdup(urlp);
+#endif
 	/* Copy URL to stack-allocated char[] */
 	urlcopy = alloca((HTTP_slash - urlp) + 2 + strlen(index_page));
 	strcpy(urlcopy, urlp);
@@ -2642,7 +2671,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 			send_headers_and_exit(HTTP_ENTITY_TOO_LARGE);
 #endif
 		dbg("header:'%s'\n", iobuf);
-#if ENABLE_FEATURE_HTTPD_CGI
+#if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_API_REGISTRY
 		/* Only POST needs to know POST_length */
 		if (prequest == request_POST && STRNCASECMP(iobuf, "Content-Length:") == 0) {
 			tptr = skip_whitespace(iobuf + sizeof("Content-Length:") - 1);
@@ -2747,6 +2776,33 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 
 	/* We are done reading headers, disable header timeout */
 	prepare_write_timeout();
+
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+	{
+		struct httpd_api_request api_req;
+		int api_rc;
+
+		memset(&api_req, 0, sizeof(api_req));
+		api_req.method = prequest;
+		api_req.target = api_target;
+		api_req.path = urlcopy;
+		api_req.query = (g_query && g_query[0]) ? g_query : NULL;
+		api_req.in_fd = STDIN_FILENO;
+		api_req.out_fd = STDOUT_FILENO;
+		api_req.content_length = G.POST_len;
+		api_req.is_head = (prequest == request_HEAD);
+
+		api_rc = httpd_api_try_handle(&api_req);
+		if (api_rc == HTTPD_API_HANDLED)
+			_exit_SUCCESS();
+		if (api_rc == HTTPD_API_ERROR)
+			_exit_FAILURE();
+	}
+# if !ENABLE_FEATURE_HTTPD_CGI
+	if (prequest != request_GET && prequest != request_HEAD)
+		send_headers_and_exit(HTTP_NOT_IMPLEMENTED);
+# endif
+#endif
 
 	if (strcmp(bb_basename(urlcopy), HTTPD_CONF) == 0) {
 		/* protect listing [/path]/httpd.conf or IP deny */
@@ -2994,6 +3050,7 @@ enum {
 	IF_FEATURE_HTTPD_AUTH_MD5(      m_opt_md5       ,)
 	IF_FEATURE_HTTPD_SETUID(        u_opt_setuid    ,)
 	p_opt_port      ,
+	IF_FEATURE_HTTPD_API_REGISTRY(A_opt_api_providers,)
 	M_opt_maxconn   ,
 	K_opt_killcgi   ,
 	i_opt_inetd     ,
@@ -3007,6 +3064,7 @@ enum {
 	OPT_MD5         = IF_FEATURE_HTTPD_AUTH_MD5(      (1 << m_opt_md5       )) + 0,
 	OPT_SETUID      = IF_FEATURE_HTTPD_SETUID(        (1 << u_opt_setuid    )) + 0,
 	OPT_PORT        = 1 << p_opt_port,
+	OPT_API_PROVIDERS = IF_FEATURE_HTTPD_API_REGISTRY((1 << A_opt_api_providers)) + 0,
 	OPT_INETD       = 1 << i_opt_inetd,
 	OPT_FOREGROUND  = 1 << f_opt_foreground,
 	OPT_VERBOSE     = 1 << v_opt_verbose,
@@ -3023,6 +3081,7 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 	IF_FEATURE_HTTPD_SETUID(const char *s_ugid = NULL;)
 	IF_FEATURE_HTTPD_SETUID(struct bb_uidgid_t ugid;)
 	IF_FEATURE_HTTPD_AUTH_MD5(const char *pass;)
+	IF_FEATURE_HTTPD_API_REGISTRY(const char *api_providers;)
 #if 0 // PACK64_LITERAL_STR test
 	char testing[16] = "Status: ";
 	printf("0x%08llx\n", PACK64_LITERAL_STR("Status: "));
@@ -3047,7 +3106,9 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 			IF_FEATURE_HTTPD_BASIC_AUTH("r:")
 			IF_FEATURE_HTTPD_AUTH_MD5("m:")
 			IF_FEATURE_HTTPD_SETUID("u:")
-			"p:M:+K:+ifv"
+			"p:"
+			IF_FEATURE_HTTPD_API_REGISTRY("A:")
+			"M:+K:+ifv"
 			"\0"
 			/* -v counts, -i implies -f */
 			"vv:if",
@@ -3057,6 +3118,7 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 			IF_FEATURE_HTTPD_AUTH_MD5(, &pass)
 			IF_FEATURE_HTTPD_SETUID(, &s_ugid)
 			, &bind_addr_or_port
+			IF_FEATURE_HTTPD_API_REGISTRY(, &api_providers)
 			, &G.conn_limit
 			, IF_FEATURE_HTTPD_CGI(&G.cgi_kill_timeout) IF_NOT_FEATURE_HTTPD_CGI(NULL)
 			, &verbose
@@ -3080,6 +3142,12 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 		crypt_make_rand64encoded(salt + 3, 8 / 2); /* 8 chars */
 		puts(pw_encrypt(pass, salt, /*cleanup:*/ 0));
 		return 0;
+	}
+#endif
+#if ENABLE_FEATURE_HTTPD_API_REGISTRY
+	if (opt & OPT_API_PROVIDERS) {
+		if (httpd_api_enable_providers(api_providers) != 0)
+			return 1;
 	}
 #endif
 #if ENABLE_FEATURE_HTTPD_SETUID
