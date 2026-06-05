@@ -60,6 +60,8 @@
 #define DS_SOCKETD_OP_START_CONTAINER 6u
 #define DS_SOCKETD_OP_STOP_CONTAINER 7u
 #define DS_SOCKETD_OP_RESTART_CONTAINER 8u
+#define DS_SOCKETD_OP_LIST_IMAGES 9u
+#define DS_SOCKETD_OP_POLL_EVENTS 10u
 
 #define DS_SOCKETD_STATUS_OK 0u
 #define DS_SOCKETD_STATUS_NOT_FOUND 3u
@@ -81,6 +83,8 @@
 #define DS_SOCKETD_CAP_LIST_CONTAINERS (1u << 4)
 #define DS_SOCKETD_CAP_INSPECT_CONTAINER (1u << 5)
 #define DS_SOCKETD_CAP_LIFECYCLE (1u << 6)
+#define DS_SOCKETD_CAP_LIST_IMAGES (1u << 7)
+#define DS_SOCKETD_CAP_POLL_EVENTS (1u << 8)
 
 #define DS_SOCKETD_REQUIRED_BASE_CAPS \
 	(DS_SOCKETD_CAP_PROTOCOL_V1 | DS_SOCKETD_CAP_PING | DS_SOCKETD_CAP_CAPABILITIES)
@@ -141,6 +145,31 @@ struct DS_SOCKETD_PACKED ds_socketd_inspect_container_req {
 struct DS_SOCKETD_PACKED ds_socketd_lifecycle_req {
 	char target[DS_SOCKETD_RECORD_NAME_MAX];
 	int32_t timeout_seconds_be;
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_poll_events_req {
+	int64_t since_be;
+};
+
+#define DS_SOCKETD_EVENT_TYPE_MAX 32
+#define DS_SOCKETD_EVENT_ACTION_MAX 32
+
+struct DS_SOCKETD_PACKED ds_socketd_core_event_record {
+	int64_t time_be;
+	int64_t time_nano_be;
+	char type[DS_SOCKETD_EVENT_TYPE_MAX];
+	char action[DS_SOCKETD_EVENT_ACTION_MAX];
+	char actor_id[DS_UUID_LEN + 1];
+	char actor_name[DS_SOCKETD_RECORD_NAME_MAX];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_image_record {
+	char name[DS_SOCKETD_RECORD_NAME_MAX];
+	char rootfs_path[DS_SOCKETD_RECORD_PATH_MAX];
+	char uuid[DS_UUID_LEN + 1];
+	int32_t is_running_be;
+	int64_t created_at_be;
+	uint8_t _pad[4];
 };
 
 struct DS_SOCKETD_PACKED ds_socketd_env_record {
@@ -257,6 +286,16 @@ static uint64_t dswebd_ntoh64(uint64_t value)
 #else
 	return ((uint64_t)ntohl((uint32_t)(value & 0xffffffffULL)) << 32)
 		| (uint64_t)ntohl((uint32_t)(value >> 32));
+#endif
+}
+
+static uint64_t dswebd_hton64(uint64_t value)
+{
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+	return value;
+#else
+	return ((uint64_t)htonl((uint32_t)(value & 0xffffffffULL)) << 32)
+		| (uint64_t)htonl((uint32_t)(value >> 32));
 #endif
 }
 
@@ -661,6 +700,78 @@ static int dswebd_backend_lifecycle(uint16_t opcode, const char *ref,
 	}
 }
 
+static int dswebd_backend_list_images(char **payload_out,
+		uint32_t *payload_len_out, char **error)
+{
+	uint16_t status;
+	uint32_t payload_len;
+	char *payload = NULL;
+	int ok;
+
+	ok = dswebd_backend_request(DS_SOCKETD_OP_LIST_IMAGES, NULL, 0,
+		&status, &payload, &payload_len, error);
+	if (!ok)
+		return 0;
+	if (status != DS_SOCKETD_STATUS_OK) {
+		dswebd_set_error(error,
+			xasprintf("LIST_IMAGES returned backend status %u",
+				(unsigned)status));
+		free(payload);
+		return 0;
+	}
+	if (payload_len % sizeof(struct ds_socketd_image_record) != 0) {
+		dswebd_set_error(error,
+			xstrdup("LIST_IMAGES returned payload of invalid size"));
+		free(payload);
+		return 0;
+	}
+
+	*payload_out = payload;
+	*payload_len_out = payload_len;
+	return 1;
+}
+
+static int dswebd_backend_poll_events(int64_t since,
+		char **payload_out, uint32_t *payload_len_out, char **error)
+{
+	struct ds_socketd_poll_events_req req;
+	uint16_t status;
+	uint32_t payload_len;
+	char *payload = NULL;
+	int ok;
+
+	if (since < 0) {
+		dswebd_set_error(error,
+			xstrdup("POLL_EVENTS does not accept a negative since value"));
+		return 0;
+	}
+
+	memset(&req, 0, sizeof(req));
+	req.since_be = (int64_t)dswebd_hton64((uint64_t)since);
+
+	ok = dswebd_backend_request(DS_SOCKETD_OP_POLL_EVENTS,
+		&req, sizeof(req), &status, &payload, &payload_len, error);
+	if (!ok)
+		return 0;
+	if (status != DS_SOCKETD_STATUS_OK) {
+		dswebd_set_error(error,
+			xasprintf("POLL_EVENTS returned backend status %u",
+				(unsigned)status));
+		free(payload);
+		return 0;
+	}
+	if (payload_len % sizeof(struct ds_socketd_core_event_record) != 0) {
+		dswebd_set_error(error,
+			xstrdup("POLL_EVENTS returned payload of invalid size"));
+		free(payload);
+		return 0;
+	}
+
+	*payload_out = payload;
+	*payload_len_out = payload_len;
+	return 1;
+}
+
 static int dswebd_check_backend(char **error)
 {
 	uint32_t caps;
@@ -768,6 +879,16 @@ static void dswebd_buf_append_u64(char **buf, size_t *len, uint64_t value)
 	snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)value);
 	dswebd_buf_append(buf, len, tmp);
 }
+
+static void dswebd_buf_append_i64(char **buf, size_t *len, int64_t value)
+{
+	char tmp[sizeof("-9223372036854775808")];
+	snprintf(tmp, sizeof(tmp), "%lld", (long long)value);
+	dswebd_buf_append(buf, len, tmp);
+}
+
+static void dswebd_append_named_json_string(char **body, size_t *len,
+		const char *name, const char *value);
 
 static int dswebd_send_response(int fd, int status, const char *reason,
 					const char *content_type, const char *body,
@@ -1243,6 +1364,298 @@ static int dswebd_send_container_list(int fd, const char *target,
 	free(payload);
 	ok = dswebd_send_response(fd, 200, "OK", "application/json",
 		body, suppress_body);
+	free(body);
+	return ok;
+}
+
+static void dswebd_append_image_json(char **body, size_t *len,
+		const struct ds_socketd_image_record *record)
+{
+	char *name = dswebd_decode_fixed_string(record->name, sizeof(record->name));
+	char *uuid = dswebd_decode_fixed_string(record->uuid, sizeof(record->uuid));
+	int is_running = ntohl((uint32_t)record->is_running_be) != 0;
+	int64_t created_at = (int64_t)dswebd_ntoh64((uint64_t)record->created_at_be);
+	char *repo_tag = xasprintf("%s:latest", name);
+
+	dswebd_buf_append(body, len, "{");
+	dswebd_buf_append(body, len, "\"Containers\":");
+	dswebd_buf_append_u32(body, len, is_running ? 1u : 0u);
+	dswebd_buf_append(body, len, ",\"Created\":");
+	dswebd_buf_append_u64(body, len, created_at > 0 ? (uint64_t)created_at : 0);
+	dswebd_buf_append(body, len, ",\"Id\":");
+	dswebd_buf_append_json_string(body, len, uuid);
+	dswebd_buf_append(body, len, ",\"Labels\":{},\"ParentId\":\"\",\"RepoDigests\":[],\"RepoTags\":[");
+	dswebd_buf_append_json_string(body, len, repo_tag);
+	dswebd_buf_append(body, len, "],\"Size\":0,\"VirtualSize\":0}");
+
+	free(name);
+	free(uuid);
+	free(repo_tag);
+}
+
+static char *dswebd_build_image_list_json(const char *payload, uint32_t payload_len)
+{
+	char *body = NULL;
+	size_t len = 0;
+	uint32_t count = payload_len / sizeof(struct ds_socketd_image_record);
+	uint32_t i;
+
+	dswebd_buf_append(&body, &len, "[");
+	for (i = 0; i < count; ++i) {
+		struct ds_socketd_image_record wire;
+
+		if (i)
+			dswebd_buf_append(&body, &len, ",");
+		memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
+		dswebd_append_image_json(&body, &len, &wire);
+	}
+	dswebd_buf_append(&body, &len, "]\n");
+	return body;
+}
+
+static int dswebd_send_image_list(int fd, unsigned suppress_body)
+{
+	char *payload = NULL;
+	uint32_t payload_len = 0;
+	char *body;
+	char *error = NULL;
+	int ok;
+
+	if (!dswebd_backend_list_images(&payload, &payload_len, &error)) {
+		ok = dswebd_send_internal_server_error(fd, error, suppress_body);
+		free(error);
+		return ok;
+	}
+
+	body = dswebd_build_image_list_json(payload, payload_len);
+	free(payload);
+	ok = dswebd_send_response(fd, 200, "OK", "application/json", body,
+		suppress_body);
+	free(body);
+	return ok;
+}
+
+static int dswebd_send_volume_list(int fd, unsigned suppress_body)
+{
+	return dswebd_send_response(fd, 200, "OK", "application/json",
+		"{\"Volumes\":[],\"Warnings\":[]}\n", suppress_body);
+}
+
+static int dswebd_send_network_list(int fd, unsigned suppress_body)
+{
+	static const char body[] =
+		"["
+		"{"
+		"\"Name\":\"droidspaces-bridge\","
+		"\"Id\":\"droidspaces-bridge\","
+		"\"Created\":\"1970-01-01T00:00:00Z\","
+		"\"Scope\":\"local\","
+		"\"Driver\":\"bridge\","
+		"\"EnableIPv6\":false,"
+		"\"IPAM\":{\"Driver\":\"default\",\"Options\":{},\"Config\":[]},"
+		"\"Internal\":false,"
+		"\"Attachable\":false,"
+		"\"Ingress\":false,"
+		"\"ConfigFrom\":{\"Network\":\"\"},"
+		"\"ConfigOnly\":false,"
+		"\"Containers\":{},"
+		"\"Options\":{},"
+		"\"Labels\":{}"
+		"},"
+		"{"
+		"\"Name\":\"host\","
+		"\"Id\":\"host\","
+		"\"Created\":\"1970-01-01T00:00:00Z\","
+		"\"Scope\":\"local\","
+		"\"Driver\":\"host\","
+		"\"EnableIPv6\":false,"
+		"\"IPAM\":{\"Driver\":\"default\",\"Options\":{},\"Config\":[]},"
+		"\"Internal\":false,"
+		"\"Attachable\":false,"
+		"\"Ingress\":false,"
+		"\"ConfigFrom\":{\"Network\":\"\"},"
+		"\"ConfigOnly\":false,"
+		"\"Containers\":{},"
+		"\"Options\":{},"
+		"\"Labels\":{}"
+		"},"
+		"{"
+		"\"Name\":\"none\","
+		"\"Id\":\"none\","
+		"\"Created\":\"1970-01-01T00:00:00Z\","
+		"\"Scope\":\"local\","
+		"\"Driver\":\"null\","
+		"\"EnableIPv6\":false,"
+		"\"IPAM\":{\"Driver\":\"default\",\"Options\":{},\"Config\":[]},"
+		"\"Internal\":false,"
+		"\"Attachable\":false,"
+		"\"Ingress\":false,"
+		"\"ConfigFrom\":{\"Network\":\"\"},"
+		"\"ConfigOnly\":false,"
+		"\"Containers\":{},"
+		"\"Options\":{},"
+		"\"Labels\":{}"
+		"}"
+		"]\n";
+
+	return dswebd_send_response(fd, 200, "OK", "application/json", body,
+		suppress_body);
+}
+
+static int dswebd_parse_nonnegative_i64(const char *value, size_t value_len,
+		int64_t *out)
+{
+	char *tmp;
+	char *end;
+	long long parsed;
+
+	*out = 0;
+	if (!value || value_len == 0)
+		return 1;
+
+	tmp = xstrndup(value, value_len);
+	errno = 0;
+	parsed = strtoll(tmp, &end, 10);
+	if (errno || *end || parsed < 0) {
+		free(tmp);
+		return 0;
+	}
+	free(tmp);
+	*out = (int64_t)parsed;
+	return 1;
+}
+
+static int dswebd_parse_events_window(const char *target,
+		int64_t *since_out, int64_t *until_out)
+{
+	const char *query = strchr(target, '?');
+	const char *pos;
+	int64_t since = 0;
+	int64_t until = 0;
+
+	if (!query || !query[1]) {
+		*since_out = 0;
+		*until_out = 0;
+		return 1;
+	}
+
+	pos = query + 1;
+	while (*pos) {
+		const char *end = strchr(pos, '&');
+		const char *eq;
+		size_t item_len;
+		size_t key_len;
+		const char *value;
+		size_t value_len;
+
+		if (!end)
+			end = pos + strlen(pos);
+		item_len = (size_t)(end - pos);
+		eq = memchr(pos, '=', item_len);
+		key_len = eq ? (size_t)(eq - pos) : item_len;
+		value = eq ? eq + 1 : end;
+		value_len = eq ? (size_t)(end - value) : 0;
+
+		if (key_len == 5 && memcmp(pos, "since", 5) == 0) {
+			if (!dswebd_parse_nonnegative_i64(value, value_len, &since))
+				return 0;
+		} else if (key_len == 5 && memcmp(pos, "until", 5) == 0) {
+			if (!dswebd_parse_nonnegative_i64(value, value_len, &until))
+				return 0;
+		}
+
+		pos = *end ? end + 1 : end;
+	}
+
+	if (since > 0 && until > 0 && since > until)
+		return 0;
+
+	*since_out = since;
+	*until_out = until;
+	return 1;
+}
+
+static void dswebd_append_event_json_line(char **body, size_t *len,
+		const struct ds_socketd_core_event_record *record)
+{
+	char *type = dswebd_decode_fixed_string(record->type, sizeof(record->type));
+	char *action = dswebd_decode_fixed_string(record->action, sizeof(record->action));
+	char *actor_id = dswebd_decode_fixed_string(record->actor_id, sizeof(record->actor_id));
+	char *actor_name = dswebd_decode_fixed_string(record->actor_name, sizeof(record->actor_name));
+	int64_t time_value = (int64_t)dswebd_ntoh64((uint64_t)record->time_be);
+	int64_t time_nano = (int64_t)dswebd_ntoh64((uint64_t)record->time_nano_be);
+
+	dswebd_buf_append(body, len, "{");
+	dswebd_append_named_json_string(body, len, "Type", type);
+	dswebd_buf_append(body, len, ",");
+	dswebd_append_named_json_string(body, len, "Action", action);
+	dswebd_buf_append(body, len, ",\"Actor\":{\"ID\":");
+	dswebd_buf_append_json_string(body, len, actor_id);
+	dswebd_buf_append(body, len, ",\"Attributes\":{");
+	if (actor_name[0]) {
+		dswebd_append_named_json_string(body, len, "name", actor_name);
+	}
+	dswebd_buf_append(body, len, "}},\"scope\":\"local\",\"time\":");
+	dswebd_buf_append_i64(body, len, time_value);
+	dswebd_buf_append(body, len, ",\"timeNano\":");
+	dswebd_buf_append_i64(body, len, time_nano);
+	dswebd_buf_append(body, len, "}\n");
+
+	free(type);
+	free(action);
+	free(actor_id);
+	free(actor_name);
+}
+
+static char *dswebd_build_event_stream(const char *payload, uint32_t payload_len,
+		int64_t until)
+{
+	char *body = NULL;
+	size_t len = 0;
+	uint32_t count = payload_len / sizeof(struct ds_socketd_core_event_record);
+	uint32_t i;
+
+	for (i = 0; i < count; ++i) {
+		struct ds_socketd_core_event_record wire;
+		int64_t time_value;
+
+		memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
+		time_value = (int64_t)dswebd_ntoh64((uint64_t)wire.time_be);
+		if (until > 0 && time_value > until)
+			continue;
+		dswebd_append_event_json_line(&body, &len, &wire);
+	}
+
+	if (!body)
+		body = xstrdup("");
+	return body;
+}
+
+static int dswebd_send_events(int fd, const char *target,
+		unsigned suppress_body)
+{
+	int64_t since;
+	int64_t until;
+	char *payload = NULL;
+	uint32_t payload_len = 0;
+	char *body;
+	char *error = NULL;
+	int ok;
+
+	if (!dswebd_parse_events_window(target, &since, &until))
+		return dswebd_send_bad_request(fd, suppress_body);
+
+	if (!dswebd_backend_poll_events(since, &payload, &payload_len, &error)) {
+		/* Match socketd's graceful degradation policy for backend event polling. */
+		free(error);
+		return dswebd_send_response(fd, 200, "OK", "application/json", "",
+			suppress_body);
+	}
+
+	body = dswebd_build_event_stream(payload, payload_len, until);
+	free(payload);
+	ok = dswebd_send_response(fd, 200, "OK", "application/json", body,
+		suppress_body);
 	free(body);
 	return ok;
 }
@@ -1886,6 +2299,31 @@ static int dswebd_handle_one(int in_fd, int out_fd)
 			free(request);
 			return r ? 0 : 1;
 		}
+	}
+
+
+	if (req.is_get && dswebd_is_api_target(req.target, "/images/json")) {
+		r = dswebd_send_image_list(out_fd, 0);
+		free(request);
+		return r ? 0 : 1;
+	}
+
+	if (req.is_get && dswebd_is_api_target(req.target, "/volumes")) {
+		r = dswebd_send_volume_list(out_fd, 0);
+		free(request);
+		return r ? 0 : 1;
+	}
+
+	if (req.is_get && dswebd_is_api_target(req.target, "/networks")) {
+		r = dswebd_send_network_list(out_fd, 0);
+		free(request);
+		return r ? 0 : 1;
+	}
+
+	if (req.is_get && dswebd_is_api_target(req.target, "/events")) {
+		r = dswebd_send_events(out_fd, req.target, 0);
+		free(request);
+		return r ? 0 : 1;
 	}
 
 	free(request);
