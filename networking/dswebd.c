@@ -35,6 +35,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <time.h>
+#include <limits.h>
 
 #define DSWEBD_MAX_REQUEST_HEADER_BYTES (16 * 1024)
 #define DSWEBD_IOBUF_SIZE 4096
@@ -56,9 +57,14 @@
 #define DS_SOCKETD_OP_INFO 3u
 #define DS_SOCKETD_OP_LIST_CONTAINERS 4u
 #define DS_SOCKETD_OP_INSPECT_CONTAINER 5u
+#define DS_SOCKETD_OP_START_CONTAINER 6u
+#define DS_SOCKETD_OP_STOP_CONTAINER 7u
+#define DS_SOCKETD_OP_RESTART_CONTAINER 8u
 
 #define DS_SOCKETD_STATUS_OK 0u
 #define DS_SOCKETD_STATUS_NOT_FOUND 3u
+#define DS_SOCKETD_STATUS_ALREADY_RUNNING 6u
+#define DS_SOCKETD_STATUS_ALREADY_STOPPED 7u
 
 #define DS_UUID_LEN 32
 #define DS_SOCKETD_RECORD_NAME_MAX 256
@@ -74,6 +80,7 @@
 #define DS_SOCKETD_CAP_INFO (1u << 3)
 #define DS_SOCKETD_CAP_LIST_CONTAINERS (1u << 4)
 #define DS_SOCKETD_CAP_INSPECT_CONTAINER (1u << 5)
+#define DS_SOCKETD_CAP_LIFECYCLE (1u << 6)
 
 #define DS_SOCKETD_REQUIRED_BASE_CAPS \
 	(DS_SOCKETD_CAP_PROTOCOL_V1 | DS_SOCKETD_CAP_PING | DS_SOCKETD_CAP_CAPABILITIES)
@@ -129,6 +136,11 @@ struct DS_SOCKETD_PACKED ds_socketd_container_record {
 
 struct DS_SOCKETD_PACKED ds_socketd_inspect_container_req {
 	char target[DS_SOCKETD_RECORD_NAME_MAX];
+};
+
+struct DS_SOCKETD_PACKED ds_socketd_lifecycle_req {
+	char target[DS_SOCKETD_RECORD_NAME_MAX];
+	int32_t timeout_seconds_be;
 };
 
 struct DS_SOCKETD_PACKED ds_socketd_env_record {
@@ -195,6 +207,12 @@ struct dswebd_info_result {
 	uint32_t containers_total;
 	uint32_t containers_running;
 	uint32_t containers_stopped;
+};
+
+struct dswebd_lifecycle_result {
+	unsigned not_found;
+	unsigned already_running;
+	unsigned already_stopped;
 };
 
 struct dswebd_req {
@@ -590,6 +608,59 @@ static int dswebd_backend_inspect_container(const char *ref,
 	return 1;
 }
 
+
+static int dswebd_backend_lifecycle(uint16_t opcode, const char *ref,
+		int timeout_seconds, struct dswebd_lifecycle_result *out, char **error)
+{
+	struct ds_socketd_lifecycle_req req;
+	uint16_t status;
+	uint32_t payload_len;
+	char *payload = NULL;
+	int ok;
+
+	memset(out, 0, sizeof(*out));
+	if (!ref || !ref[0] || strlen(ref) >= DS_SOCKETD_RECORD_NAME_MAX) {
+		dswebd_set_error(error, xstrdup("container reference is empty or too long"));
+		return 0;
+	}
+	if (timeout_seconds < -1) {
+		dswebd_set_error(error, xstrdup("container lifecycle timeout is invalid"));
+		return 0;
+	}
+
+	memset(&req, 0, sizeof(req));
+	strncpy(req.target, ref, sizeof(req.target) - 1);
+	req.timeout_seconds_be = (int32_t)htonl((uint32_t)timeout_seconds);
+
+	ok = dswebd_backend_request(opcode, &req, sizeof(req),
+		&status, &payload, &payload_len, error);
+	free(payload);
+	if (!ok)
+		return 0;
+
+	if (status == DS_SOCKETD_STATUS_OK)
+		return 1;
+
+	switch (status) {
+	case DS_SOCKETD_STATUS_NOT_FOUND:
+		out->not_found = 1;
+		dswebd_set_error(error, xstrdup("container not found"));
+		return 0;
+	case DS_SOCKETD_STATUS_ALREADY_RUNNING:
+		out->already_running = 1;
+		dswebd_set_error(error, xstrdup("container already running"));
+		return 0;
+	case DS_SOCKETD_STATUS_ALREADY_STOPPED:
+		out->already_stopped = 1;
+		dswebd_set_error(error, xstrdup("container already stopped"));
+		return 0;
+	default:
+		dswebd_set_error(error,
+			xasprintf("LIFECYCLE returned backend status %u", (unsigned)status));
+		return 0;
+	}
+}
+
 static int dswebd_check_backend(char **error)
 {
 	uint32_t caps;
@@ -728,6 +799,36 @@ static int dswebd_send_response(int fd, int status, const char *reason,
 	if (!suppress_body && body_len)
 		return dswebd_send_all(fd, body, body_len);
 	return 1;
+}
+
+
+static int dswebd_send_empty_response(int fd, int status, const char *reason)
+{
+	char *header;
+	int ok;
+
+	header = xasprintf(
+		"HTTP/1.1 %d %s\r\n"
+		"Content-Length: 0\r\n"
+		"Server: Droidspaces/6 (Container, like Docker)\r\n"
+		"Api-Version: %s\r\n"
+		"Ostype: %s\r\n"
+		"Connection: close\r\n"
+		"\r\n",
+		status, reason, DSWEBD_API_VERSION, DSWEBD_OS_TYPE);
+	ok = dswebd_send_all(fd, header, strlen(header));
+	free(header);
+	return ok;
+}
+
+static int dswebd_send_no_content(int fd)
+{
+	return dswebd_send_empty_response(fd, 204, "No Content");
+}
+
+static int dswebd_send_not_modified(int fd)
+{
+	return dswebd_send_empty_response(fd, 304, "Not Modified");
 }
 
 static int dswebd_send_bad_request(int fd, unsigned suppress_body)
@@ -1428,6 +1529,95 @@ static int dswebd_send_container_inspect(int fd, const char *ref,
 	return ok;
 }
 
+
+static int dswebd_parse_nonnegative_int(const char *value, size_t value_len,
+		int *out)
+{
+	char *tmp;
+	char *end;
+	unsigned parsed;
+
+	if (!value || value_len == 0)
+		return 0;
+	tmp = xstrndup(value, value_len);
+	errno = 0;
+	parsed = bb_strtou(tmp, &end, 10);
+	if (errno || *end || parsed > INT_MAX) {
+		free(tmp);
+		return 0;
+	}
+	free(tmp);
+	*out = (int)parsed;
+	return 1;
+}
+
+static int dswebd_parse_lifecycle_timeout(const char *target,
+		int *timeout_seconds)
+{
+	const char *query = strchr(target, '?');
+	const char *pos;
+
+	*timeout_seconds = -1;
+	if (!query || !query[1])
+		return 1;
+
+	pos = query + 1;
+	while (*pos) {
+		const char *end = strchr(pos, '&');
+		const char *eq;
+		size_t item_len;
+		size_t key_len;
+		const char *value;
+		size_t value_len;
+
+		if (!end)
+			end = pos + strlen(pos);
+		item_len = (size_t)(end - pos);
+		eq = memchr(pos, '=', item_len);
+		key_len = eq ? (size_t)(eq - pos) : item_len;
+		value = eq ? eq + 1 : end;
+		value_len = eq ? (size_t)(end - value) : 0;
+
+		if (key_len == 1 && *pos == 't') {
+			if (!dswebd_parse_nonnegative_int(value, value_len, timeout_seconds))
+				return 0;
+		}
+
+		pos = *end ? end + 1 : end;
+	}
+
+	return 1;
+}
+
+static int dswebd_send_lifecycle(int fd, const char *target, const char *ref,
+		uint16_t opcode, int timeout_seconds, unsigned check_timeout)
+{
+	struct dswebd_lifecycle_result result;
+	char *error = NULL;
+	int ok;
+
+	if (check_timeout && !dswebd_parse_lifecycle_timeout(target, &timeout_seconds))
+		return dswebd_send_bad_request(fd, 0);
+
+	if (dswebd_backend_lifecycle(opcode, ref, timeout_seconds, &result, &error)) {
+		free(error);
+		return dswebd_send_no_content(fd);
+	}
+
+	if (result.not_found) {
+		free(error);
+		return dswebd_send_not_found(fd, 0);
+	}
+	if (result.already_running || result.already_stopped) {
+		free(error);
+		return dswebd_send_not_modified(fd);
+	}
+
+	ok = dswebd_send_internal_server_error(fd, error, 0);
+	free(error);
+	return ok;
+}
+
 static int is_ascii_digit(char c)
 {
 	return c >= '0' && c <= '9';
@@ -1663,6 +1853,35 @@ static int dswebd_handle_one(int in_fd, int out_fd)
 		char *ref = dswebd_parse_container_ref_with_suffix(req.target, "/json");
 		if (ref) {
 			r = dswebd_send_container_inspect(out_fd, ref, 0);
+			free(ref);
+			free(request);
+			return r ? 0 : 1;
+		}
+	}
+
+	if (req.is_post) {
+		char *ref = dswebd_parse_container_ref_with_suffix(req.target, "/start");
+		if (ref) {
+			r = dswebd_send_lifecycle(out_fd, req.target, ref,
+				DS_SOCKETD_OP_START_CONTAINER, -1, 0);
+			free(ref);
+			free(request);
+			return r ? 0 : 1;
+		}
+
+		ref = dswebd_parse_container_ref_with_suffix(req.target, "/stop");
+		if (ref) {
+			r = dswebd_send_lifecycle(out_fd, req.target, ref,
+				DS_SOCKETD_OP_STOP_CONTAINER, -1, 1);
+			free(ref);
+			free(request);
+			return r ? 0 : 1;
+		}
+
+		ref = dswebd_parse_container_ref_with_suffix(req.target, "/restart");
+		if (ref) {
+			r = dswebd_send_lifecycle(out_fd, req.target, ref,
+				DS_SOCKETD_OP_RESTART_CONTAINER, -1, 1);
 			free(ref);
 			free(request);
 			return r ? 0 : 1;
